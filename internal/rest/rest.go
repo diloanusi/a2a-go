@@ -178,28 +178,19 @@ var errToDetails = map[error]errorDetails{
 	},
 }
 
-// ToA2AError converts an HTTP error response in google.rpc.Status format to an a2a error.
-func ToA2AError(resp *http.Response) error {
-	contentType := resp.Header.Get("Content-Type")
-	if !strings.HasPrefix(contentType, "application/json") {
-		return a2a.ErrServerError
-	}
+// ErrorBodyJSON is the JSON shape of the inner error object in a google.rpc.Status response.
+type ErrorBodyJSON struct {
+	Code    int               `json:"code"`
+	Status  string            `json:"status"`
+	Message string            `json:"message"`
+	Details []json.RawMessage `json:"details"`
+}
 
-	var body struct {
-		Error struct {
-			Code    int               `json:"code"`
-			Status  string            `json:"status"`
-			Message string            `json:"message"`
-			Details []json.RawMessage `json:"details"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return fmt.Errorf("failed to decode error response: %w", err)
-	}
-
+// ConvertErrorBody converts a parsed google.rpc.Status error body into an a2a error.
+func ConvertErrorBody(body *ErrorBodyJSON) error {
 	baseErr := a2a.ErrInternalError
 	details := map[string]any{}
-	for _, raw := range body.Error.Details {
+	for _, raw := range body.Details {
 		var hint struct {
 			Type string `json:"@type"`
 		}
@@ -225,11 +216,79 @@ func ToA2AError(resp *http.Response) error {
 		}
 	}
 
-	out := a2a.NewError(baseErr, body.Error.Message)
+	out := a2a.NewError(baseErr, body.Message)
 	if len(details) > 0 {
 		out = out.WithDetails(details)
 	}
 	return out
+}
+
+// ToA2AError converts an HTTP error response in google.rpc.Status format to an a2a error.
+func ToA2AError(resp *http.Response) error {
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "application/json") {
+		return a2a.ErrServerError
+	}
+
+	var body struct {
+		Error ErrorBodyJSON `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return fmt.Errorf("failed to decode error response: %w", err)
+	}
+
+	return ConvertErrorBody(&body.Error)
+}
+
+// streamResponse is the JSON shape of a REST SSE stream response.
+type streamResponse struct {
+	Message        *a2a.Message                 `json:"message,omitempty"`
+	Task           *a2a.Task                    `json:"task,omitempty"`
+	StatusUpdate   *a2a.TaskStatusUpdateEvent   `json:"statusUpdate,omitempty"`
+	ArtifactUpdate *a2a.TaskArtifactUpdateEvent `json:"artifactUpdate,omitempty"`
+	Error          *ErrorBodyJSON               `json:"error,omitempty"`
+}
+
+// ParseStreamResponse parses raw SSE stream data in a single JSON unmarshal.
+// Returns (event, nil) for event payloads or (nil, err) for server-side errors.
+func ParseStreamResponse(data []byte) (a2a.Event, error) {
+	var wrapper streamResponse
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal stream response: %w", err)
+	}
+	var n int
+	var event a2a.Event
+	var errResp error
+	if wrapper.Message != nil {
+		event = wrapper.Message
+		n++
+	}
+	if wrapper.Task != nil {
+		event = wrapper.Task
+		n++
+	}
+	if wrapper.StatusUpdate != nil {
+		event = wrapper.StatusUpdate
+		n++
+	}
+	if wrapper.ArtifactUpdate != nil {
+		event = wrapper.ArtifactUpdate
+		n++
+	}
+	if wrapper.Error != nil {
+		errResp = ConvertErrorBody(wrapper.Error)
+		n++
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("unknown stream response type")
+	}
+	if n != 1 {
+		return nil, fmt.Errorf("expected exactly one stream response type, got %d", n)
+	}
+	if errResp != nil {
+		return nil, errResp
+	}
+	return event, nil
 }
 
 // ToRESTError converts an error and a [a2a.TaskID] to a REST [Error] in google.rpc.Status format.
